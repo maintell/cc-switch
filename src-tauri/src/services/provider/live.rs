@@ -521,6 +521,61 @@ pub(crate) fn codex_managed_oauth_live_auth(
     )
 }
 
+/// Extract credential from an OpenCode provider's settings_config.
+///
+/// Priority:
+/// 1. `settings_config.auth` (new-style, source-tagged object)
+/// 2. `settings_config.options.apiKey` (legacy inline string)
+///
+/// Returns the auth value to write to `auth.json[provider_id]`, or None.
+/// Auth entries are always objects; unknown fields within the object are preserved.
+fn extract_opencode_credential(settings_config: &Value) -> Option<Value> {
+    if let Some(obj) = settings_config.as_object() {
+        // Prefer settings_config.auth (must be an object)
+        if let Some(auth) = obj.get("auth") {
+            if let Some(auth_obj) = auth.as_object() {
+                let mut cleaned = auth_obj.clone();
+                cleaned.remove("source");
+                if !cleaned.is_empty() {
+                    return Some(Value::Object(cleaned));
+                }
+            }
+            return None;
+        }
+
+        // Fallback: options.apiKey (skip empty/whitespace-only)
+        if let Some(api_key) = obj
+            .get("options")
+            .and_then(|o| o.get("apiKey"))
+            .and_then(|v| v.as_str())
+        {
+            if !api_key.trim().is_empty() {
+                return Some(json!({"type": "api", "key": api_key}));
+            }
+        }
+    }
+    None
+}
+
+/// Strip credential fields from an OpenCode provider config so they are
+/// not written to opencode.json. Removes `auth` and non-empty `options.apiKey`.
+/// Empty/whitespace-only `options.apiKey` is preserved to match legacy behavior.
+fn strip_opencode_credential_from_config(config: &mut Value) {
+    if let Some(obj) = config.as_object_mut() {
+        obj.remove("auth");
+        if let Some(options) = obj.get_mut("options").and_then(|v| v.as_object_mut()) {
+            let should_remove = options
+                .get("apiKey")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if should_remove {
+                options.remove("apiKey");
+            }
+        }
+    }
+}
+
 /// Write live configuration snapshot for a provider
 pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Result<(), AppError> {
     match app_type {
@@ -560,7 +615,20 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
             ));
         }
         AppType::OpenCode => {
-            // OpenCode uses additive mode - write provider to config
+            // OpenCode additive mode — provider definition vs credential split:
+            //
+            //   ~/.config/opencode/opencode.json  provider[provider_id]  →  provider definition
+            //   ~/.local/share/opencode/auth.json  [provider_id]         →  credential (when auth.json is missing or valid)
+            //
+            // If auth.json exists but is invalid, do not overwrite it;
+            // fall back to legacy inline options.apiKey in opencode.json instead.
+            // provider_id is the binding key between both files.
+            //
+            // Current OpenCode auth entries are object-shaped Auth.Info values
+            // (api, oauth, wellknown). Non-object entries are not supported.
+            // JSONC is intentionally out of scope for auth.json in this stage.
+            // Full DB migration from existing options.apiKey is not required yet.
+            use crate::opencode_auth;
             use crate::opencode_config;
             use crate::provider::{OpenCodeConfigFormat, OpenCodeProviderConfig};
 
@@ -570,7 +638,7 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
                 .and_then(|meta| meta.opencode_config_format);
 
             // Defensive check: if settings_config is a full config structure, extract provider fragment
-            let config_to_write = if let Some(obj) = provider.settings_config.as_object() {
+            let mut config_to_write = if let Some(obj) = provider.settings_config.as_object() {
                 // Detect full config structure (has $schema or top-level provider field)
                 if obj.contains_key("$schema")
                     || obj.contains_key("provider")
@@ -602,6 +670,70 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
             } else {
                 provider.settings_config.clone()
             };
+
+            // Extract credential: prefer settings_config.auth, fall back to options.apiKey.
+            let credential = extract_opencode_credential(&config_to_write);
+
+            // Try writing credential to auth.json[provider_id].
+            // If auth.json exists but is invalid, fall back to legacy inline
+            // options.apiKey in opencode.json instead of failing entirely.
+            let mut auth_json_written = false;
+            if let Some(cred) = &credential {
+                match opencode_auth::set_opencode_auth_entry(&provider.id, cred.clone()) {
+                    Ok(()) => {
+                        auth_json_written = true;
+                    }
+                    Err(e) => {
+                        let auth_path = opencode_auth::get_opencode_auth_path();
+                        if auth_path.exists() {
+                            // auth.json exists but is invalid or unwritable —
+                            // fall back to legacy inline options.apiKey
+                            log::warn!(
+                                "auth.json is not safely editable for provider '{}', \
+                                 falling back to inline options.apiKey: {e}",
+                                provider.id
+                            );
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+
+            // Only strip credential fields from opencode.json if auth.json
+            // write succeeded; otherwise keep/restore options.apiKey as legacy fallback.
+            if auth_json_written {
+                strip_opencode_credential_from_config(&mut config_to_write);
+            } else {
+                // Still strip the internal auth field even in legacy fallback
+                if let Some(obj) = config_to_write.as_object_mut() {
+                    obj.remove("auth");
+                }
+                // If credential came from internal auth object (not inline apiKey),
+                // restore the API key to options.apiKey so live config remains usable.
+                // Also override any empty/whitespace inline placeholder with the real key.
+                if credential.is_some() {
+                    if let Some(key) = credential
+                        .as_ref()
+                        .and_then(|c| c.get("key").and_then(|v| v.as_str()))
+                    {
+                        if let Some(obj) = config_to_write.as_object_mut() {
+                            let existing_is_empty = obj
+                                .get("options")
+                                .and_then(|o| o.get("apiKey"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim().is_empty())
+                                .unwrap_or(true);
+                            if existing_is_empty {
+                                obj.entry("options")
+                                    .or_insert_with(|| json!({}))
+                                    .as_object_mut()
+                                    .map(|opts| opts.insert("apiKey".to_string(), json!(key)));
+                            }
+                        }
+                    }
+                }
+            }
 
             let format = opencode_config::provider_format(&config_to_write, source_format);
             if format == OpenCodeConfigFormat::V2 {
@@ -1198,6 +1330,7 @@ pub(crate) fn remove_opencode_provider_from_live(provider_id: &str) -> Result<()
 /// into the CC Switch database. Each provider found will be added to the
 /// database with is_current set to false.
 pub fn import_opencode_providers_from_live(state: &AppState) -> Result<usize, AppError> {
+    use crate::opencode_auth;
     use crate::opencode_config;
     use crate::provider::{OpenCodeConfigFormat, OpenCodeProviderConfig};
 
@@ -1206,11 +1339,28 @@ pub fn import_opencode_providers_from_live(state: &AppState) -> Result<usize, Ap
         return Ok(0);
     }
 
+    // Read auth.json: bind provider credentials via provider-id keyed entries.
+    // If auth.json is missing, import proceeds without credentials.
+    // If auth.json exists but is invalid, abort to avoid silent data loss.
+    let auth_map = match opencode_auth::read_opencode_auth() {
+        Ok(map) => Some(map),
+        Err(e) => {
+            let auth_path = opencode_auth::get_opencode_auth_path();
+            if auth_path.exists() {
+                return Err(AppError::Config(format!(
+                    "Failed to read OpenCode auth.json: {e}"
+                )));
+            }
+            log::debug!("No OpenCode auth.json found, importing providers without credentials");
+            None
+        }
+    };
+
     let mut imported = 0;
     let mut updated = 0;
     let existing_ids = state.db.get_provider_ids("opencode")?;
 
-    for (id, (settings_config, format)) in providers {
+    for (id, (mut settings_config, format)) in providers {
         // Keep validation and display-name extraction separate from persistence.
         // Serializing this partial type would discard fields such as api, env,
         // and models.<id>.limit.input before they ever reach the database.
@@ -1230,6 +1380,19 @@ pub fn import_opencode_providers_from_live(state: &AppState) -> Result<usize, Ap
                 .map(str::to_owned),
         };
         let native_format = (format == OpenCodeConfigFormat::V2).then_some(format);
+
+        // Attach auth.json[provider_id] as settings_config.auth if present.
+        // Only object entries are processed; non-object entries are skipped
+        // since auth.json entries are always objects per upstream convention.
+        if let Some(auth_entry) = auth_map.as_ref().and_then(|m| m.get(&id)) {
+            if let Some(map) = auth_entry.as_object() {
+                let mut obj = map.clone();
+                obj.insert("source".to_string(), json!("opencode_auth_json"));
+                if let Some(settings) = settings_config.as_object_mut() {
+                    settings.insert("auth".to_string(), Value::Object(obj));
+                }
+            }
+        }
 
         if existing_ids.contains(&id) {
             match state.db.get_provider_by_id(&id, "opencode") {

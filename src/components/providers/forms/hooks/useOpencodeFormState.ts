@@ -6,6 +6,7 @@ import {
   OPENCODE_EXTRA_OPTION_DRAFT_PREFIX,
   OPENCODE_HEADER_DRAFT_PREFIX,
   isKnownOpencodeOptionKey,
+  isManagedOpencodeSecretOptionKey,
   parseOpencodeConfig,
   toOpencodeExtraOptions,
 } from "../helpers/opencodeFormUtils";
@@ -51,6 +52,16 @@ export function useOpencodeFormState({
       : null;
   const initialOpencodeOptions = initialOpencodeConfig?.options || {};
 
+  const resolveInitialApiKey = (): string => {
+    if (appId !== "opencode") return "";
+    const auth = initialOpencodeConfig?.auth;
+    if (auth && auth.type === "api" && typeof auth.key === "string") {
+      return auth.key;
+    }
+    const value = initialOpencodeOptions.apiKey;
+    return typeof value === "string" ? value : "";
+  };
+
   const [opencodeProviderKey, setOpencodeProviderKey] = useState<string>(() => {
     if (appId !== "opencode") return "";
     return providerId || "";
@@ -62,9 +73,7 @@ export function useOpencodeFormState({
   });
 
   const [opencodeApiKey, setOpencodeApiKey] = useState<string>(() => {
-    if (appId !== "opencode") return "";
-    const value = initialOpencodeOptions.apiKey;
-    return typeof value === "string" ? value : "";
+    return resolveInitialApiKey();
   });
 
   const [opencodeBaseUrl, setOpencodeBaseUrl] = useState<string>(() => {
@@ -124,8 +133,23 @@ export function useOpencodeFormState({
     (apiKey: string) => {
       setOpencodeApiKey(apiKey);
       updateOpencodeSettings((config) => {
-        if (!config.options) config.options = {};
-        config.options.apiKey = apiKey;
+        if (apiKey.trim()) {
+          config.auth = {
+            source: "opencode_auth_json",
+            type: "api",
+            key: apiKey,
+          };
+        } else {
+          const existingAuth = config.auth;
+          if (
+            existingAuth &&
+            typeof existingAuth === "object" &&
+            (existingAuth as Record<string, unknown>).type === "api"
+          ) {
+            delete config.auth;
+          }
+        }
+        delete (config.options || {}).apiKey;
       });
     },
     [updateOpencodeSettings],
@@ -183,14 +207,22 @@ export function useOpencodeFormState({
         if (!config.options) config.options = {};
 
         for (const k of Object.keys(config.options)) {
-          if (!isKnownOpencodeOptionKey(k)) {
+          if (
+            !isKnownOpencodeOptionKey(k) ||
+            isManagedOpencodeSecretOptionKey(k)
+          ) {
             delete config.options[k];
           }
         }
 
         for (const [k, v] of Object.entries(options)) {
           const trimmedKey = k.trim();
-          if (trimmedKey && !k.startsWith(OPENCODE_EXTRA_OPTION_DRAFT_PREFIX)) {
+          if (
+            trimmedKey &&
+            !k.startsWith(OPENCODE_EXTRA_OPTION_DRAFT_PREFIX) &&
+            !trimmedKey.startsWith("option-") &&
+            !isManagedOpencodeSecretOptionKey(trimmedKey)
+          ) {
             try {
               config.options[trimmedKey] = JSON.parse(v);
             } catch {
@@ -207,7 +239,12 @@ export function useOpencodeFormState({
     setOpencodeProviderKey("");
     setOpencodeNpm(config?.npm || OPENCODE_DEFAULT_NPM);
     setOpencodeBaseUrl(config?.options?.baseURL || "");
-    setOpencodeApiKey(config?.options?.apiKey || "");
+    const auth = config?.auth;
+    if (auth && auth.type === "api" && typeof auth.key === "string") {
+      setOpencodeApiKey(auth.key);
+    } else {
+      setOpencodeApiKey(config?.options?.apiKey || "");
+    }
     setOpencodeHeaders(config?.options?.headers || {});
     setOpencodeModels(config?.models || {});
     setOpencodeExtraOptions(toOpencodeExtraOptions(config?.options || {}));

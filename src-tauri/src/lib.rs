@@ -26,6 +26,7 @@ mod mcp;
 pub mod mode;
 mod model_capabilities;
 mod openclaw_config;
+mod opencode_auth;
 mod opencode_config;
 mod panic_hook;
 mod pi_config;

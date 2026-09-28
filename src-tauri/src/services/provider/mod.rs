@@ -44,6 +44,8 @@ pub fn import_pi_providers_from_live(state: &AppState) -> Result<usize, AppError
 pub use claude_editor::{EditorSave, EditorView};
 
 // Internal re-exports (pub(crate))
+#[cfg(test)]
+pub(crate) use live::write_live_snapshot;
 pub(crate) use live::{
     provider_exists_in_live_config, sync_additive_app_to_live, write_live_for_state,
     LiveSyncOutcome,
@@ -157,6 +159,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::TempDir;
+
+    mod opencode_auth;
 
     struct TempHome {
         #[allow(dead_code)]
@@ -2341,26 +2345,6 @@ requires_openai_auth = true
 
     #[test]
     #[serial]
-    fn sync_current_provider_for_app_skips_db_only_opencode_provider() {
-        with_test_home(|state, _| {
-            let provider = opencode_provider("db-only-opencode");
-            ProviderService::add(state, AppType::OpenCode, provider.clone(), false)
-                .expect("seed db-only opencode provider");
-
-            ProviderService::sync_current_provider_for_app(state, AppType::OpenCode)
-                .expect("sync additive opencode providers");
-
-            let live_providers = crate::opencode_config::get_providers()
-                .expect("read opencode providers after sync");
-            assert!(
-                !live_providers.contains_key(&provider.id),
-                "db-only opencode provider should not be written to live during sync"
-            );
-        });
-    }
-
-    #[test]
-    #[serial]
     fn sync_current_provider_for_app_skips_db_only_openclaw_provider() {
         with_test_home(|state, _| {
             let provider = openclaw_provider("db-only-openclaw");
@@ -2375,63 +2359,6 @@ requires_openai_auth = true
             assert!(
                 !live_providers.contains_key(&provider.id),
                 "db-only openclaw provider should not be written to live during sync"
-            );
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn sync_current_provider_for_app_preserves_legacy_live_opencode_provider() {
-        with_test_home(|state, _| {
-            let provider = opencode_provider("legacy-opencode");
-            crate::opencode_config::set_provider(&provider.id, provider.settings_config.clone())
-                .expect("seed opencode live provider");
-            state
-                .db
-                .save_provider(AppType::OpenCode.as_str(), &provider)
-                .expect("seed legacy opencode provider in db");
-
-            let mut updated = provider.clone();
-            updated.settings_config["options"]["apiKey"] = Value::String("updated-key".to_string());
-            state
-                .db
-                .save_provider(AppType::OpenCode.as_str(), &updated)
-                .expect("update legacy opencode provider in db");
-
-            ProviderService::sync_current_provider_for_app(state, AppType::OpenCode)
-                .expect("sync legacy opencode provider");
-
-            let live_providers =
-                crate::opencode_config::get_providers().expect("read opencode providers");
-            assert_eq!(
-                live_providers
-                    .get(&provider.id)
-                    .and_then(|config| config.get("options"))
-                    .and_then(|options| options.get("apiKey")),
-                Some(&Value::String("updated-key".to_string())),
-                "legacy provider that already exists in live should still be synced"
-            );
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn sync_current_provider_for_app_restores_legacy_opencode_provider_after_live_reset() {
-        with_test_home(|state, _| {
-            let provider = opencode_provider("legacy-opencode-reset");
-            state
-                .db
-                .save_provider(AppType::OpenCode.as_str(), &provider)
-                .expect("seed legacy opencode provider in db");
-
-            ProviderService::sync_current_provider_for_app(state, AppType::OpenCode)
-                .expect("sync legacy opencode provider after reset");
-
-            let live_providers =
-                crate::opencode_config::get_providers().expect("read opencode providers");
-            assert!(
-                live_providers.contains_key(&provider.id),
-                "legacy opencode provider should be restored when live config is reset"
             );
         });
     }
@@ -3800,34 +3727,6 @@ wire_api = "responses"
 
             let live = crate::opencode_config::get_providers().unwrap();
             assert_eq!(live[&provider.id], expected);
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn import_opencode_providers_from_live_marks_provider_as_live_managed() {
-        with_test_home(|state, _| {
-            let provider = opencode_provider("imported-opencode");
-            crate::opencode_config::set_provider(&provider.id, provider.settings_config.clone())
-                .expect("seed opencode live provider");
-
-            let imported = import_opencode_providers_from_live(state)
-                .expect("import opencode providers from live");
-            assert_eq!(imported, 1);
-
-            let saved = state
-                .db
-                .get_provider_by_id(&provider.id, AppType::OpenCode.as_str())
-                .expect("query imported opencode provider")
-                .expect("imported opencode provider should exist");
-            assert_eq!(
-                saved
-                    .meta
-                    .as_ref()
-                    .and_then(|meta| meta.live_config_managed),
-                Some(true),
-                "providers imported from live should be treated as live-managed"
-            );
         });
     }
 
