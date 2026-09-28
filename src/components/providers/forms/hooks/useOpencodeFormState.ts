@@ -220,7 +220,6 @@ export function useOpencodeFormState({
           if (
             trimmedKey &&
             !k.startsWith(OPENCODE_EXTRA_OPTION_DRAFT_PREFIX) &&
-            !trimmedKey.startsWith("option-") &&
             !isManagedOpencodeSecretOptionKey(trimmedKey)
           ) {
             try {

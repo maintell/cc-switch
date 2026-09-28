@@ -3641,9 +3641,18 @@ wire_api = "responses"
                     saved.settings_config["options"]["apiKey"] = json!("fake-new");
                     ProviderService::update(state, AppType::OpenCode, None, saved.clone()).unwrap();
                     expected["provider"]["shared"] = saved.settings_config.clone();
+                    // auth.json 模型：写回时凭据拆到 auth.json，opencode.json 只留定义。
+                    expected["provider"]["shared"]["options"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("apiKey");
                     assert_eq!(
                         crate::opencode_config::read_opencode_config().unwrap(),
                         expected
+                    );
+                    assert_eq!(
+                        crate::opencode_auth::get_opencode_auth_entry("shared").unwrap(),
+                        Some(json!({"type": "api", "key": "fake-new"}))
                     );
                     assert_eq!(
                         state
@@ -3660,10 +3669,21 @@ wire_api = "responses"
                     ProviderService::sync_current_provider_for_app(state, AppType::OpenCode)
                         .unwrap();
                     expected["provider"]["shared"] = saved.settings_config;
+                    expected["provider"]["shared"]["options"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("apiKey");
                     assert_eq!(
                         crate::opencode_config::read_opencode_config().unwrap(),
                         expected
                     );
+                    assert_eq!(
+                        crate::opencode_auth::get_opencode_auth_entry("shared").unwrap(),
+                        Some(json!({"type": "api", "key": "fake-synced"}))
+                    );
+                    // DB 里仍是写回前的内联 apiKey，首次重导入把它对齐成
+                    // auth.json 拆分形态（返回 1）；之后必须幂等（返回 0）。
+                    assert_eq!(import_opencode_providers_from_live(state).unwrap(), 1);
                     assert_eq!(import_opencode_providers_from_live(state).unwrap(), 0);
                 });
             }
@@ -3695,11 +3715,17 @@ wire_api = "responses"
             assert_eq!(import_opencode_providers_from_live(state).unwrap(), 0);
 
             saved.settings_config["options"]["apiKey"] = json!("updated-key");
-            let expected = saved.settings_config.clone();
+            let mut expected = saved.settings_config.clone();
             ProviderService::update(state, AppType::OpenCode, None, saved)
                 .expect("update imported provider");
+            // auth.json 模型：写回时凭据拆到 auth.json，opencode.json 只留定义。
+            expected["options"].as_object_mut().unwrap().remove("apiKey");
             let live = crate::opencode_config::get_providers().unwrap();
             assert_eq!(live[&provider.id], expected);
+            assert_eq!(
+                crate::opencode_auth::get_opencode_auth_entry(&provider.id).unwrap(),
+                Some(json!({"type": "api", "key": "updated-key"}))
+            );
         });
     }
 
@@ -3715,18 +3741,24 @@ wire_api = "responses"
                 "context": 128000,
                 "output": 8000
             });
-            let expected = provider.settings_config.clone();
+            let mut expected = provider.settings_config.clone();
+            // auth.json 模型：写回时凭据拆到 auth.json，opencode.json 只留定义。
+            expected["options"].as_object_mut().unwrap().remove("apiKey");
 
             // Exercise the full-config fragment extraction as well as the writer.
             provider.settings_config = json!({
                 "$schema": "https://opencode.ai/config.json",
-                "provider": { provider.id.clone(): expected.clone() }
+                "provider": { provider.id.clone(): provider.settings_config.clone() }
             });
             live::write_live_snapshot(&AppType::OpenCode, &provider)
                 .expect("write opencode provider");
 
             let live = crate::opencode_config::get_providers().unwrap();
             assert_eq!(live[&provider.id], expected);
+            assert_eq!(
+                crate::opencode_auth::get_opencode_auth_entry(&provider.id).unwrap(),
+                Some(json!({"type": "api", "key": "test-key"}))
+            );
         });
     }
 
