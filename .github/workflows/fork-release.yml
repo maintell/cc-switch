@@ -125,6 +125,10 @@ jobs:
           name: CC Switch ${{ github.ref_name }} (fork build)
           # fork 构建不带签名，明确标成预发布，避免和上游正式版混淆
           prerelease: true
+          # 忘了这一行的话 action 只会警告、仍然建出一个空 release（已经没有文件可传却显示成功）
+          files: release-assets/*
+          # 产物没匹配上就直接失败，别再静默发出一个没有安装包的 release
+          fail_on_unmatched_files: true
           body: |
             ## CC Switch ${{ github.ref_name }} — fork 构建
 
