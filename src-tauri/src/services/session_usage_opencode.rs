@@ -58,14 +58,22 @@ enum OpenCodeSchema {
     V2,
 }
 
-/// 探测数据库使用的存储布局：`session_v2` 与 `session_message` 同时存在
-/// 视为 V2，否则回退 V1。
+/// 探测数据库使用的存储布局。
+///
+/// 只看表是否存在会误判：某些库（例如 OpenCode 1.19 升级后残留的 schema）里
+/// `session_v2` / `session_message` 两张表存在但**为空**，真实数据仍写在 V1 的
+/// `session` / `message`。此时若按表存在判为 V2，就会去查空表、一条也同步不到。
+/// 因此 V2 表存在时还要确认 V2 里确实有会话数据（或 V1 表已不存在）才走 V2。
 fn detect_schema(conn: &rusqlite::Connection) -> Result<OpenCodeSchema, AppError> {
     if sqlite_table_exists(conn, "session_v2")? && sqlite_table_exists(conn, "session_message")? {
-        Ok(OpenCodeSchema::V2)
-    } else {
-        Ok(OpenCodeSchema::V1)
+        let v2_sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_v2", [], |row| row.get(0))
+            .map_err(|e| AppError::Database(format!("统计 session_v2 失败: {e}")))?;
+        if v2_sessions > 0 || !sqlite_table_exists(conn, "session")? {
+            return Ok(OpenCodeSchema::V2);
+        }
     }
+    Ok(OpenCodeSchema::V1)
 }
 
 fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, AppError> {
@@ -727,6 +735,24 @@ mod tests {
             .unwrap();
         assert_eq!(detect_schema(&conn).unwrap(), OpenCodeSchema::V1);
 
+        // V2 表存在但为空、V1 仍有数据（OpenCode 1.19 残留 schema）→ 必须回退 V1，
+        // 否则会去查空的 session_v2，导致用量统计静默归零。
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT); CREATE TABLE session_message (id TEXT);",
+        )
+        .unwrap();
+        assert_eq!(detect_schema(&conn).unwrap(), OpenCodeSchema::V1);
+
+        // V2 表里有会话数据 → 走 V2（真迁移场景）。
+        conn.execute_batch("INSERT INTO session_v2 VALUES ('s1');")
+            .unwrap();
+        assert_eq!(detect_schema(&conn).unwrap(), OpenCodeSchema::V2);
+    }
+
+    #[test]
+    fn test_detect_schema_v2_only_without_v1_tables() {
+        // 纯 V2 库（没有 V1 表）：即使 V2 暂时为空也走 V2。
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE session_v2 (id TEXT); CREATE TABLE session_message (id TEXT);",
         )
