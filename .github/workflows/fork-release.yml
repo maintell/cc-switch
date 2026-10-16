@@ -1,0 +1,149 @@
+# fork 专用发布流程（maintell/cc-switch 独有，上游没有这个文件）。
+#
+# 为什么不复用上游的 release.yml：maintell 这个 fork 里没有任何 Actions secrets，
+# 也没有 Apple 开发者证书。上游 release.yml 要求 5 个平台（含 macOS 公证）共 9 个
+# 签名文件齐全才建 Release，缺一个就在 publish-release 直接失败。
+#
+# 这里的产物只用于**手动安装**：`tauri.conf.json` 的 updater 端点指向
+# dl.ccswitch.io / farion1231/cc-switch，fork 的包永远收不到自动更新，因此
+# 干脆关掉 updater 产物（`createUpdaterArtifacts: false`），也就不需要签名密钥。
+# 换来的代价是产物没有 .sig / latest.json —— 对本用途没有影响。
+name: Fork Release (Windows x64)
+
+on:
+  # 手动触发只是干跑：完整编译并把产物留在 workflow 里，不建 GitHub Release
+  workflow_dispatch:
+  push:
+    tags:
+      # 故意不匹配 v*：那个 glob 属于上游 release.yml，别去撞它
+      - 'fork-*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release-${{ github.event_name }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build Windows x64 (MSI + portable)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+          pnpm --version
+
+      # rust-toolchain.toml 是编译器版本的唯一来源，和上游 release.yml 保持一致
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Windows MSI (no updater artifacts)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 覆盖而不是改 tauri.conf.json：保持仓库里上游配置原样，减少将来合并冲突
+          '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content -Path tauri.fork-build.json -Encoding utf8
+          pnpm tauri build --bundles msi --config tauri.fork-build.json
+
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          # 与上游 release.yml 同样的命名习惯（标签名里可能带 /，换成 -）
+          $VERSION = $env:GITHUB_REF_NAME -replace '/', '-'
+
+          $msi = Get-ChildItem -Path 'src-tauri/target/release/bundle/msi' -Recurse -Include *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $msi) {
+            throw 'No Windows MSI installer found'
+          }
+          $dest = "CC-Switch-$VERSION-Windows.msi"
+          Copy-Item $msi.FullName (Join-Path release-assets $dest)
+          Write-Host "Installer copied: $dest"
+
+          # 绿色版：仅可执行文件打 zip
+          $exePath = @(
+            'src-tauri/target/release/cc-switch.exe',
+            'src-tauri/target/x86_64-pc-windows-msvc/release/cc-switch.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($null -eq $exePath) {
+            throw 'Portable exe not found'
+          }
+          $portableDir = 'release-assets/CC-Switch-Portable'
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          Copy-Item $exePath $portableDir
+          @('# CC Switch portable build marker', 'portable=true') |
+            Set-Content -Path (Join-Path $portableDir 'portable.ini') -Encoding UTF8
+          Compress-Archive -Path "$portableDir/*" `
+            -DestinationPath "release-assets/CC-Switch-$VERSION-Windows-Portable.zip" -Force
+          Remove-Item -Recurse -Force $portableDir
+          Write-Host "Portable zip ready: CC-Switch-$VERSION-Windows-Portable.zip"
+
+      - name: List prepared assets
+        shell: bash
+        run: ls -la release-assets
+
+      - name: Upload artifacts to workflow
+        uses: actions/upload-artifact@v7
+        with:
+          name: fork-release-assets-windows-x64
+          path: release-assets/*
+          if-no-files-found: error
+
+      # 只有推 tag 才建 Release；手动触发仅验证编译
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: CC Switch ${{ github.ref_name }} (fork build)
+          # fork 构建不带签名，明确标成预发布，避免和上游正式版混淆
+          prerelease: true
+          body: |
+            ## CC Switch ${{ github.ref_name }} — fork 构建
+
+            基于上游 `farion1231/cc-switch` v4.0.13 的快照构建，用于手动安装。
+
+            包含的修复：
+
+            - **MiniMax Code 用量不再显示 `unknown`**：源库 `local_runtime_token_usage.model`
+              上游从不写入，改为按「行内 model → 同 turn 消息遥测 → 会话 effectiveModel →
+              unknown」四级回退，并回填历史 unknown 行的模型、耗时与费用（上游 PR #7706）
+            - **OpenCode 用量不再静默归零**：OpenCode 1.19 残留的空 `session_v2` 表
+              会让导入器查空表，改为确认 v2 确实有会话数据才用它
+
+            ### 下载（Windows x86_64）
+
+            - `CC-Switch-${{ github.ref_name }}-Windows.msi`（安装版）
+            - `CC-Switch-${{ github.ref_name }}-Windows-Portable.zip`（绿色版，解压即用）
+
+            > 这是 fork 构建：**不参与自动更新**（应用内置更新源指向上游），
+            > 也不含代码签名与 macOS/Linux 产物。macOS / Linux 与自动更新请用上游 Release。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
